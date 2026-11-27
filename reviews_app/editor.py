@@ -297,14 +297,29 @@ class EditorTab(QWidget):
         if added:
             self.message.emit(f"Добавлено картинок: {added} ✓")
         else:
-            details = "\n".join(errors[:5])
-            QMessageBox.warning(
-                self, "Не получилось добавить",
-                "Не удалось получить картинку из того, что перетащили.\n\n"
-                "Попробуйте: правый клик по картинке в браузере → «Копировать картинку», "
-                "затем Ctrl+V здесь. Или сохраните её на компьютер и перетащите файл."
-                + (f"\n\nПодробности:\n{details}" if details else ""),
-            )
+            self._report_failure(data, errors)
+
+    def _report_failure(self, data: DropData, errors: list[str]) -> None:
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Warning)
+        box.setWindowTitle("Не получилось добавить")
+        box.setText("Не удалось достать картинку из того, что перетащили.")
+        box.setInformativeText(
+            "Что можно сделать:\n"
+            "• в браузере правый клик по картинке → «Копировать картинку», затем Ctrl+V здесь;\n"
+            "• или сохраните картинку на компьютер и перетащите файл.\n\n"
+            "Если хотите, чтобы это починили, — нажмите «Скопировать подробности» и перешлите текст."
+        )
+        details = data.describe()
+        if errors:
+            details += "\n\nОшибки:\n" + "\n".join(errors[:10])
+        box.setDetailedText(details)
+        copy_btn = box.addButton("Скопировать подробности", QMessageBox.ActionRole)
+        box.addButton(QMessageBox.Ok)
+        box.exec()
+        if box.clickedButton() is copy_btn:
+            QApplication.clipboard().setText(details)
+            self.message.emit("Подробности скопированы — вставьте их в сообщение ✓")
 
     def paste_images(self) -> None:
         data = snapshot(QApplication.clipboard().mimeData())

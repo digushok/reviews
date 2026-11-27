@@ -90,3 +90,60 @@ def test_image_data_only_and_failures(tmp_path):
     m = QMimeData()
     m.setText("просто текст")
     assert not snapshot(m).has_anything()
+
+
+def gif_1x1() -> str:
+    buf = io.BytesIO()
+    Image.new("RGB", (1, 1)).save(buf, "GIF")
+    return "data:image/gif;base64," + base64.b64encode(buf.getvalue()).decode()
+
+
+def test_lazy_placeholder_is_skipped_and_real_image_taken(tmp_path):
+    site = tmp_path / "site"
+    site.mkdir()
+    big = io.BytesIO()
+    Image.new("RGB", (300, 200), (1, 2, 3)).save(big, "WEBP")
+    (site / "photo.jpeg").write_bytes(big.getvalue())  # как у Ozon: .jpeg, а внутри WebP
+    (site / "small.webp").write_bytes(webp_bytes())
+    srv, base = serve(site)
+    try:
+        m = QMimeData()
+        m.setHtml(
+            f'<div><img src="{gif_1x1()}" data-src="{base}/photo.jpeg" '
+            f'srcset="{base}/small.webp 100w, {base}/photo.jpeg 800w"></div>'
+        )
+        paths, errors = extract_images(snapshot(m), tmp_path / "w")
+        assert len(paths) == 1, paths
+        with Image.open(paths[0]) as im:
+            assert im.format == "WEBP" and im.size == (300, 200)
+    finally:
+        srv.shutdown()
+
+
+def test_url_only_in_text_and_file_without_extension(tmp_path):
+    site = tmp_path / "site"
+    site.mkdir()
+    (site / "p.jpeg").write_bytes(webp_bytes())
+    srv, base = serve(site)
+    try:
+        m = QMimeData()
+        m.setText(f"Фото: {base}/p.jpeg")
+        paths, _ = extract_images(snapshot(m), tmp_path / "w")
+        assert len(paths) == 1
+    finally:
+        srv.shutdown()
+
+    f = tmp_path / "noext"
+    f.write_bytes(webp_bytes())
+    m = QMimeData()
+    m.setUrls([QUrl.fromLocalFile(str(f))])
+    paths, _ = extract_images(snapshot(m), tmp_path / "w2")
+    assert len(paths) == 1 and paths[0].suffix == ".webp"
+
+
+def test_describe_for_diagnostics():
+    m = QMimeData()
+    m.setText("https://www.ozon.ru/product/123/")
+    m.setHtml('<a href="https://www.ozon.ru/product/123/">товар</a>')
+    text = snapshot(m).describe()
+    assert "text/html" in text and "ozon.ru/product/123" in text

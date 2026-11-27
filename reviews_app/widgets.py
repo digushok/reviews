@@ -104,7 +104,8 @@ class DropImageList(ImageList):
             theme.repolish(self)
 
     def dragEnterEvent(self, e):
-        if snapshot(e.mimeData(), read_payload=False).has_anything():
+        # принимаем всё: если картинки там не окажется, покажем, что пришло (для диагностики)
+        if e.source() is not self and e.mimeData() is not None and e.mimeData().formats():
             e.setDropAction(Qt.CopyAction)
             e.accept()
             self._set_over(True)
@@ -121,10 +122,9 @@ class DropImageList(ImageList):
     def dropEvent(self, e):
         self._set_over(False)
         data = snapshot(e.mimeData())
-        if data.has_anything():
-            e.setDropAction(Qt.CopyAction)
-            e.accept()
-            self.dropped.emit(data)
+        e.setDropAction(Qt.CopyAction)
+        e.accept()
+        self.dropped.emit(data)
 
     def paintEvent(self, e):
         super().paintEvent(e)
