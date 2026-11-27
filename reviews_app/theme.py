@@ -67,6 +67,10 @@ QPushButton[kind="icon"]:hover {{ background: {CARD}; color: {ACCENT}; border-co
 #ProductBox QAbstractItemView {{ background: {CARD}; border: 1px solid {BORDER}; border-radius: 8px; padding: 4px;
     selection-background-color: {ACCENT_SOFT}; selection-color: {TEXT}; outline: none; }}
 
+QPushButton[kind="update"] {{ background: #e7f7ee; border: 1px solid #b9e6cb; color: #1c7c4a; }}
+QPushButton[kind="update"]:hover {{ background: #d5f1e1; border-color: #1c7c4a; color: #1c7c4a; }}
+#Version {{ color: {MUTED}; padding: 0 10px; font-weight: 600; }}
+
 QPlainTextEdit, QTextEdit {{
     background: #fbfbfd; border: 1px solid {BORDER}; border-radius: 10px;
     padding: 10px; font-size: 11pt; selection-background-color: {ACCENT};

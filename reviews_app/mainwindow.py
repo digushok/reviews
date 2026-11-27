@@ -5,7 +5,7 @@ import os
 import sys
 from pathlib import Path
 
-from PySide6.QtCore import Qt, QTimer, QUrl
+from PySide6.QtCore import QThread, Qt, QTimer, QUrl, Signal
 from PySide6.QtGui import QDesktopServices
 from PySide6.QtWidgets import (
     QApplication,
@@ -27,11 +27,32 @@ from . import __version__, theme
 from .editor import EditorTab
 from .imaging import convert_to_jpeg
 from .paths import default_data_dir
+from . import updater
 from .storage import Store, safe_name
 from .viewer import ViewerTab
 from .widgets import button, label
 
 APP_NAME = "Отзывы"
+
+
+class Task(QThread):
+    """Выполнить функцию в фоне, результат — сигналом."""
+
+    done = Signal(object)
+    failed = Signal(str)
+    progress = Signal(int, int)
+
+    def __init__(self, fn, pass_self: bool = False):
+        super().__init__()
+        self.fn = fn
+        self.pass_self = pass_self
+        self.cancel = False
+
+    def run(self):
+        try:
+            self.done.emit(self.fn(self) if self.pass_self else self.fn())
+        except Exception as e:
+            self.failed.emit(str(e) or e.__class__.__name__)
 
 
 class MainWindow(QMainWindow):
@@ -94,6 +115,13 @@ class MainWindow(QMainWindow):
         prod_row.addWidget(prod)
         prod_row.addWidget(label("Отзывы и папки ведутся отдельно для каждого товара", "Muted"))
         prod_row.addStretch(1)
+        self.btn_update = button("", "update", "Скачать и установить новую версию")
+        self.btn_update.clicked.connect(self.install_update)
+        self.btn_update.hide()
+        prod_row.addWidget(self.btn_update)
+        self.btn_check = button("Проверить обновления", "ghost")
+        self.btn_check.clicked.connect(lambda: self.check_updates(silent=False))
+        prod_row.addWidget(self.btn_check)
 
         seg = QFrame()
         seg.setObjectName("Segment")
@@ -128,6 +156,8 @@ class MainWindow(QMainWindow):
 
         self.info = QLabel()
         self.statusBar().addPermanentWidget(self.info)
+        self.version_label = label(f"Версия {__version__}", "Version")
+        self.statusBar().addPermanentWidget(self.version_label)
         self.statusBar().setSizeGripEnabled(False)
 
         self.editor.changed.connect(self._update_status)
@@ -138,6 +168,126 @@ class MainWindow(QMainWindow):
         self._update_status()
         if notice:
             QTimer.singleShot(300, lambda: QMessageBox.information(self, APP_NAME, notice))
+
+        self.latest: updater.Release | None = None
+        self._tasks: list[Task] = []
+        updater.cleanup_old()
+        QTimer.singleShot(5000, updater.cleanup_old)  # старый процесс мог ещё закрываться
+        QTimer.singleShot(2000, lambda: self.check_updates(silent=True))
+
+    # ---------- обновления ----------
+    def _run(self, fn, done, fail) -> "Task":
+        t = Task(fn)
+        t.done.connect(done)
+        t.failed.connect(fail)
+        t.finished.connect(lambda: self._tasks.remove(t) if t in self._tasks else None)
+        self._tasks.append(t)
+        t.start()
+        return t
+
+    def check_updates(self, silent: bool) -> None:
+        self.btn_check.setEnabled(False)
+        self.btn_check.setText("Проверяю…")
+
+        def done(rel):
+            self.btn_check.setEnabled(True)
+            self.btn_check.setText("Проверить обновления")
+            if updater.is_newer(rel.version, __version__) and rel.url:
+                self.latest = rel
+                self.btn_update.setText(f"⬆  Обновить до v{rel.version}")
+                self.btn_update.show()
+                self.version_label.setText(f"Версия {__version__}  ·  доступна v{rel.version}")
+                if not silent:
+                    self.install_update()
+            else:
+                self.btn_update.hide()
+                self.version_label.setText(f"Версия {__version__}")
+                if not silent:
+                    self.statusBar().showMessage(f"У вас последняя версия ({__version__}) ✓", 4000)
+
+        def fail(err):
+            self.btn_check.setEnabled(True)
+            self.btn_check.setText("Проверить обновления")
+            if not silent:
+                QMessageBox.warning(self, APP_NAME, f"Не удалось проверить обновления.\n\n{err}")
+
+        self._run(updater.fetch_latest, done, fail)
+
+    def install_update(self) -> None:
+        rel = self.latest
+        if rel is None:
+            return
+        notes = f"\n\nЧто нового:\n{rel.notes[:1500]}" if rel.notes else ""
+        if not updater.can_self_update():
+            if QMessageBox.question(self, APP_NAME, f"Доступна версия {rel.version}. Открыть страницу загрузки?{notes}") \
+                    == QMessageBox.Yes:
+                QDesktopServices.openUrl(QUrl(rel.page))
+            return
+        if QMessageBox.question(
+            self, "Обновление",
+            f"Установить версию {rel.version}? (сейчас {__version__})\n\n"
+            f"Программа скачает обновление и перезапустится. Отзывы сохранятся.{notes}",
+        ) != QMessageBox.Yes:
+            return
+
+        self.editor.commit()
+        exe = updater.current_exe()
+        new = updater.new_path(exe)
+        dlg = QProgressDialog("Скачиваю обновление…", "Отмена", 0, 100, self)
+        dlg.setWindowTitle("Обновление")
+        dlg.setWindowModality(Qt.WindowModal)
+        dlg.setMinimumDuration(0)
+        dlg.setValue(0)
+        self.btn_update.setEnabled(False)
+
+        def work(task):
+            updater.download(
+                rel.url, new,
+                progress=lambda d, t: task.progress.emit(d, t or rel.size),
+                cancelled=lambda: task.cancel,
+            )
+            return new
+
+        def on_progress(d, t):
+            if t:
+                dlg.setValue(min(99, int(d * 100 / t)))
+                dlg.setLabelText(f"Скачиваю обновление…  {d / 1048576:.1f} из {t / 1048576:.1f} МБ")
+
+        def done(_):
+            task.wait(3000)
+            dlg.setValue(100)
+            dlg.close()
+            try:
+                updater.swap_files(exe, new)
+                self.editor._leave_current()
+                updater.launch(exe)
+            except Exception as e:
+                self.btn_update.setEnabled(True)
+                QMessageBox.warning(
+                    self, APP_NAME,
+                    f"Не получилось установить обновление автоматически:\n{e}\n\n"
+                    f"Скачайте его вручную со страницы релиза.",
+                )
+                QDesktopServices.openUrl(QUrl(rel.page))
+                return
+            self._restarting = True
+            QApplication.quit()
+
+        def fail(err):
+            dlg.close()
+            self.btn_update.setEnabled(True)
+            new.unlink(missing_ok=True)
+            if "отменено" not in err:
+                QMessageBox.warning(self, APP_NAME, f"Не удалось скачать обновление.\n\n{err}")
+
+        task = Task(work, pass_self=True)
+        task.done.connect(done)
+        task.failed.connect(fail)
+        task.progress.connect(on_progress)
+        dlg.canceled.connect(lambda: setattr(task, "cancel", True))
+        task.finished.connect(lambda: self._tasks.remove(task) if task in self._tasks else None)
+        self._tasks.append(task)
+        task.start()
 
     # ---------- товары ----------
     def _fill_products(self) -> None:
@@ -226,7 +376,7 @@ class MainWindow(QMainWindow):
         parts = [f"Отзывов: {n}", f"фото: {imgs}"]
         if pending:
             parts.append(f"ждут преобразования: {pending}")
-        self.info.setText("   ·   ".join(parts) + f"      v{__version__}  ")
+        self.info.setText("   ·   ".join(parts) + "   ")
         self.btn_convert.setText(f"Преобразовать в JPEG  ({pending})" if pending else "Преобразовать в JPEG")
 
     def convert_all(self, quiet: bool = False) -> None:

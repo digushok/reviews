@@ -11,6 +11,10 @@ on:
         description: "Версия релиза, например v1.0.1 (пусто — просто собрать exe)"
         required: false
         default: ""
+      notes:
+        description: "Что нового (текст для релиза)"
+        required: false
+        default: ""
 
 permissions:
   contents: write
@@ -58,3 +62,4 @@ jobs:
           name: ${{ inputs.version }}
           target_commitish: ${{ github.sha }}
           files: dist/Reviews.exe
+          body: ${{ inputs.notes }}
