@@ -5,7 +5,7 @@ import os
 import sys
 from pathlib import Path
 
-from PySide6.QtCore import Qt, QUrl
+from PySide6.QtCore import Qt, QTimer, QUrl
 from PySide6.QtGui import QDesktopServices
 from PySide6.QtWidgets import (
     QApplication,
@@ -26,6 +26,7 @@ from PySide6.QtWidgets import (
 from . import __version__, theme
 from .editor import EditorTab
 from .imaging import convert_to_jpeg
+from .paths import default_data_dir
 from .storage import Store, safe_name
 from .viewer import ViewerTab
 from .widgets import button, label
@@ -33,24 +34,13 @@ from .widgets import button, label
 APP_NAME = "Отзывы"
 
 
-def default_data_dir() -> Path:
-    """Папка «ReviewsData» рядом с программой; если туда писать нельзя — в Документах."""
-    base = Path(sys.executable).parent if getattr(sys, "frozen", False) else Path(__file__).resolve().parent.parent
-    candidate = base / "ReviewsData"
-    try:
-        candidate.mkdir(parents=True, exist_ok=True)
-        probe = candidate / ".write_test"
-        probe.write_text("ok")
-        probe.unlink()
-        return candidate
-    except OSError:
-        return Path.home() / "Documents" / "ReviewsData"
-
-
 class MainWindow(QMainWindow):
     def __init__(self, data_dir: Path | None = None):
         super().__init__()
-        self.store = Store(data_dir or default_data_dir())
+        notice = None
+        if data_dir is None:
+            data_dir, notice = default_data_dir()
+        self.store = Store(data_dir)
         self.setWindowTitle(APP_NAME)
         self.resize(1200, 800)
         self.setMinimumSize(900, 600)
@@ -146,6 +136,8 @@ class MainWindow(QMainWindow):
         self.viewer.product = self.editor.product
         self._fill_products()
         self._update_status()
+        if notice:
+            QTimer.singleShot(300, lambda: QMessageBox.information(self, APP_NAME, notice))
 
     # ---------- товары ----------
     def _fill_products(self) -> None:
