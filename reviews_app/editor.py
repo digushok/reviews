@@ -133,8 +133,31 @@ class EditorTab(QWidget):
         self._save_timer = QTimer(self, singleShot=True, interval=700)
         self._save_timer.timeout.connect(self.commit)
 
+        self.setAcceptDrops(True)  # бросить картинку можно в любое место вкладки
+
         self.reload()
         self.next_review()  # начинаем с нового пустого отзыва
+
+    # ---------- перетаскивание на всю вкладку ----------
+    def dragEnterEvent(self, e):
+        if e.mimeData() is not None and e.mimeData().formats():
+            e.setDropAction(Qt.CopyAction)
+            e.accept()
+            self.images._set_over(True)
+
+    def dragMoveEvent(self, e):
+        e.setDropAction(Qt.CopyAction)
+        e.accept()
+
+    def dragLeaveEvent(self, e):
+        self.images._set_over(False)
+
+    def dropEvent(self, e):
+        self.images._set_over(False)
+        data = snapshot(e.mimeData())
+        e.setDropAction(Qt.CopyAction)
+        e.accept()
+        QTimer.singleShot(0, lambda: self.import_drop(data))
 
     # ---------- список ----------
     def reload(self, select: Review | None = None) -> None:

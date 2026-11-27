@@ -424,6 +424,47 @@ class MainWindow(QMainWindow):
         super().closeEvent(e)
 
 
+def install_error_handler() -> None:
+    """Ошибки не проглатываем: пишем в журнал и показываем окно (в exe нет консоли)."""
+    import datetime
+    import traceback
+
+    from .paths import DATA_NAME, documents_dir
+
+    log = documents_dir() / DATA_NAME / "errors.log"
+    shown = {"busy": False}
+
+    def hook(exc_type, exc, tb):
+        text = "".join(traceback.format_exception(exc_type, exc, tb))
+        try:
+            log.parent.mkdir(parents=True, exist_ok=True)
+            with open(log, "a", encoding="utf-8") as f:
+                f.write(f"\n=== {datetime.datetime.now():%Y-%m-%d %H:%M:%S}  v{__version__}\n{text}")
+        except OSError:
+            pass
+        sys.__stderr__ and sys.__stderr__.write(text)
+        if shown["busy"] or QApplication.instance() is None:
+            return
+
+        def show():
+            shown["busy"] = True
+            try:
+                box = QMessageBox(QMessageBox.Critical, APP_NAME, "Произошла ошибка. Работа продолжается, данные сохранены.")
+                box.setInformativeText(f"{exc_type.__name__}: {exc}\n\nЖурнал: {log}")
+                box.setDetailedText(text)
+                copy_btn = box.addButton("Скопировать подробности", QMessageBox.ActionRole)
+                box.addButton(QMessageBox.Ok)
+                box.exec()
+                if box.clickedButton() is copy_btn:
+                    QApplication.clipboard().setText(f"v{__version__}\n{text}")
+            finally:
+                shown["busy"] = False
+
+        QTimer.singleShot(0, show)
+
+    sys.excepthook = hook
+
+
 def main() -> int:
     if os.name == "nt":
         try:
@@ -435,6 +476,7 @@ def main() -> int:
     app = QApplication(sys.argv)
     app.setApplicationName(APP_NAME)
     theme.apply(app)
+    install_error_handler()
     data_dir = Path(sys.argv[1]) if len(sys.argv) > 1 else None
     w = MainWindow(data_dir)
     w.show()

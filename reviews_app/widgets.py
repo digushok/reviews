@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from PySide6.QtCore import QMimeData, QRectF, QSize, Qt, QUrl, Signal
+from PySide6.QtCore import QMimeData, QRectF, QSize, Qt, QTimer, QUrl, Signal
 from PySide6.QtGui import QColor, QDrag, QFont, QIcon, QPainter, QPen, QPixmap
 from PySide6.QtWidgets import QHBoxLayout, QLabel, QListView, QListWidget, QListWidgetItem, QPlainTextEdit, QPushButton
 
@@ -24,7 +24,16 @@ def thumbnail(path: Path, size: int) -> QPixmap:
         return QPixmap()
     if key not in _thumb_cache:
         try:
-            _thumb_cache[key] = QPixmap.fromImage(load_qimage(path, size))
+            img = load_qimage(path, size)
+            # вписываем в одинаковый квадрат: иначе сетка подстраивается под первую картинку
+            # и вертикальные/горизонтальные миниатюры обрезаются
+            canvas = QPixmap(size, size)
+            canvas.fill(Qt.transparent)
+            p = QPainter(canvas)
+            p.setRenderHint(QPainter.SmoothPixmapTransform)
+            p.drawImage((size - img.width()) // 2, (size - img.height()) // 2, img)
+            p.end()
+            _thumb_cache[key] = canvas
         except Exception:
             _thumb_cache[key] = QPixmap()
     return _thumb_cache[key]
@@ -94,8 +103,11 @@ class DropImageList(ImageList):
     def __init__(self, thumb_size: int, parent=None):
         super().__init__(thumb_size, parent)
         self.setObjectName("DropZone")
-        self.setAcceptDrops(True)
         self.setDragDropMode(QListWidget.DropOnly)
+        self.setAcceptDrops(True)
+        # ВАЖНО: setMovement(Static) в ImageList выключает приём у viewport — включаем обратно,
+        # иначе перетаскивание из проводника/браузера молча игнорируется
+        self.viewport().setAcceptDrops(True)
         self.setProperty("dragOver", False)
 
     def _set_over(self, on: bool) -> None:
@@ -124,7 +136,8 @@ class DropImageList(ImageList):
         data = snapshot(e.mimeData())
         e.setDropAction(Qt.CopyAction)
         e.accept()
-        self.dropped.emit(data)
+        # обрабатываем после выхода из обработчика: браузер не ждёт скачивания и диалогов
+        QTimer.singleShot(0, lambda: self.dropped.emit(data))
 
     def paintEvent(self, e):
         super().paintEvent(e)
@@ -217,7 +230,8 @@ class ReviewTextEdit(QPlainTextEdit):
         if self._images_only(e.mimeData()):
             e.setDropAction(Qt.CopyAction)
             e.accept()
-            self.dropped.emit(snapshot(e.mimeData()))
+            data = snapshot(e.mimeData())
+            QTimer.singleShot(0, lambda: self.dropped.emit(data))
         else:
             super().dropEvent(e)
 
