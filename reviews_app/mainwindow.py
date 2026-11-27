@@ -9,17 +9,26 @@ from PySide6.QtCore import Qt, QUrl
 from PySide6.QtGui import QDesktopServices
 from PySide6.QtWidgets import (
     QApplication,
+    QButtonGroup,
+    QComboBox,
+    QInputDialog,
+    QFrame,
+    QHBoxLayout,
+    QLabel,
     QMainWindow,
     QMessageBox,
     QProgressDialog,
-    QTabWidget,
-    QToolBar,
+    QStackedWidget,
+    QVBoxLayout,
+    QWidget,
 )
 
+from . import __version__, theme
 from .editor import EditorTab
 from .imaging import convert_to_jpeg
-from .storage import Store
+from .storage import Store, safe_name
 from .viewer import ViewerTab
+from .widgets import button, label
 
 APP_NAME = "Отзывы"
 
@@ -43,72 +52,230 @@ class MainWindow(QMainWindow):
         super().__init__()
         self.store = Store(data_dir or default_data_dir())
         self.setWindowTitle(APP_NAME)
-        self.resize(1150, 780)
+        self.resize(1200, 800)
+        self.setMinimumSize(900, 600)
 
         self.editor = EditorTab(self.store)
         self.viewer = ViewerTab(self.store)
-        self.tabs = QTabWidget()
-        self.tabs.addTab(self.editor, "1. Ввод отзывов")
-        self.tabs.addTab(self.viewer, "2. Просмотр (JPEG)")
-        self.tabs.currentChanged.connect(self._on_tab)
-        self.setCentralWidget(self.tabs)
+        self.stack = QStackedWidget()
+        self.stack.addWidget(self.editor)
+        self.stack.addWidget(self.viewer)
 
-        tb = QToolBar()
-        tb.setMovable(False)
-        tb.setToolButtonStyle(Qt.ToolButtonTextOnly)
-        tb.addAction("⟳  Преобразовать в JPEG", self.convert_all)
-        tb.addSeparator()
-        tb.addAction("Открыть папку с данными", self.open_data_dir)
-        self.addToolBar(tb)
+        # --- шапка ---
+        header = QFrame()
+        header.setObjectName("Header")
+        outer = QVBoxLayout(header)
+        outer.setContentsMargins(20, 12, 20, 12)
+        outer.setSpacing(10)
+        hl = QHBoxLayout()
+        hl.setSpacing(12)
+        outer.addLayout(hl)
+        dot = QLabel()
+        dot.setObjectName("AppDot")
+        dot.setFixedSize(12, 12)
+        hl.addWidget(dot)
+        hl.addWidget(label(APP_NAME, "AppTitle"))
+        hl.addSpacing(18)
+
+        prod_row = QHBoxLayout()
+        prod_row.setSpacing(10)
+        outer.addLayout(prod_row)
+        prod = QFrame()
+        prod.setObjectName("ProductBar")
+        pl = QHBoxLayout(prod)
+        pl.setContentsMargins(10, 4, 4, 4)
+        pl.setSpacing(4)
+        pl.addWidget(label("Товар:", "Muted"))
+        self.product_box = QComboBox()
+        self.product_box.setObjectName("ProductBox")
+        self.product_box.setSizeAdjustPolicy(QComboBox.AdjustToMinimumContentsLengthWithIcon)
+        self.product_box.setMinimumContentsLength(18)
+        self.product_box.setFixedWidth(250)
+        self.product_box.setCursor(Qt.PointingHandCursor)
+        self.product_box.activated.connect(self._on_product_chosen)
+        pl.addWidget(self.product_box)
+        for text, tip, slot in (("＋", "Новый товар", self.add_product),
+                                ("✎", "Переименовать товар", self.rename_product),
+                                ("✕", "Удалить товар вместе с его отзывами", self.delete_product)):
+            b = button(text, "icon", tip)
+            b.setFixedSize(32, 32)
+            b.clicked.connect(slot)
+            pl.addWidget(b)
+        prod_row.addWidget(prod)
+        prod_row.addWidget(label("Отзывы и папки ведутся отдельно для каждого товара", "Muted"))
+        prod_row.addStretch(1)
+
+        seg = QFrame()
+        seg.setObjectName("Segment")
+        sl = QHBoxLayout(seg)
+        sl.setContentsMargins(4, 4, 4, 4)
+        sl.setSpacing(4)
+        self.tab_buttons = QButtonGroup(self)
+        for i, text in enumerate(("✎  Ввод отзывов", "▤  Просмотр")):
+            b = button(text)
+            b.setCheckable(True)
+            sl.addWidget(b)
+            self.tab_buttons.addButton(b, i)
+        self.tab_buttons.button(0).setChecked(True)
+        self.tab_buttons.idClicked.connect(self.switch_tab)
+        hl.addWidget(seg)
+        hl.addStretch(1)
+
+        btn_folder = button("Открыть папку", "ghost", "Открыть папку с готовыми JPEG этого товара")
+        btn_folder.clicked.connect(self.open_data_dir)
+        hl.addWidget(btn_folder)
+        self.btn_convert = button("Преобразовать в JPEG", "primary", "Перевести все картинки в .jpg и открыть просмотр")
+        self.btn_convert.clicked.connect(self.convert_all)
+        hl.addWidget(self.btn_convert)
+
+        central = QWidget()
+        cl = QVBoxLayout(central)
+        cl.setContentsMargins(0, 0, 0, 0)
+        cl.setSpacing(0)
+        cl.addWidget(header)
+        cl.addWidget(self.stack, 1)
+        self.setCentralWidget(central)
+
+        self.info = QLabel()
+        self.statusBar().addPermanentWidget(self.info)
+        self.statusBar().setSizeGripEnabled(False)
 
         self.editor.changed.connect(self._update_status)
+        self.editor.changed.connect(self._fill_products)
+        self.editor.message.connect(lambda m: self.statusBar().showMessage(m, 3000))
+        self.viewer.product = self.editor.product
+        self._fill_products()
+        self._update_status()
+
+    # ---------- товары ----------
+    def _fill_products(self) -> None:
+        self.product_box.blockSignals(True)
+        self.product_box.clear()
+        for p in self.store.products:
+            n = sum(1 for r in self.store.reviews_of(p) if not r.is_empty())
+            self.product_box.addItem(f"{p.name}   ({n})", p.id)
+        self.product_box.setCurrentIndex(self.store.products.index(self.editor.product))
+        self.product_box.blockSignals(False)
+
+    def _select_product(self, p) -> None:
+        self.editor.set_product(p)
+        self.viewer.product = p
+        self._fill_products()
+        if self.stack.currentIndex() == 1:
+            self.viewer.refresh()
+        self._update_status()
+
+    def _on_product_chosen(self, idx: int) -> None:
+        p = self.store.product(self.product_box.itemData(idx))
+        if p is not None:
+            self._select_product(p)
+
+    def _ask_name(self, title: str, text: str = "") -> str | None:
+        while True:
+            name, ok = QInputDialog.getText(self, title, "Название товара:", text=text)
+            if not ok:
+                return None
+            if name.strip():
+                return name
+            text = name
+
+    def add_product(self) -> None:
+        name = self._ask_name("Новый товар")
+        if name is None:
+            return
+        try:
+            p = self.store.add_product(name)
+        except ValueError as e:
+            QMessageBox.warning(self, APP_NAME, str(e))
+            return
+        self._select_product(p)
+        self.statusBar().showMessage(f"Товар «{p.name}» создан ✓", 3000)
+
+    def rename_product(self) -> None:
+        p = self.editor.product
+        name = self._ask_name("Переименовать товар", p.name)
+        if name is None or name == p.name:
+            return
+        try:
+            self.store.rename_product(p, name)
+        except ValueError as e:
+            QMessageBox.warning(self, APP_NAME, str(e))
+            return
+        self.editor.refresh_product_name()
+        self._fill_products()
+        self._update_status()
+
+    def delete_product(self) -> None:
+        p = self.editor.product
+        n = sum(1 for r in self.store.reviews_of(p) if not r.is_empty())
+        msg = f"Удалить товар «{p.name}»?"
+        if n:
+            msg += f"\n\nВместе с ним удалятся {n} отзыв(ов) и все их картинки."
+        if QMessageBox.question(self, "Удалить товар", msg) != QMessageBox.Yes:
+            return
+        self.editor._leave_current()
+        self.store.delete_product(p)
+        self._select_product(self.store.ensure_product())
+
+    def switch_tab(self, idx: int) -> None:
+        self.tab_buttons.button(idx).setChecked(True)
+        if idx == 1:
+            self.editor.commit()
+            self.convert_all(quiet=True)  # быстро, если всё уже готово
+            self._fill_products()
+            self.viewer.refresh()
+        self.stack.setCurrentIndex(idx)
         self._update_status()
 
     def _update_status(self) -> None:
         n = sum(1 for r in self.store.reviews if not r.is_empty())
         imgs = sum(len(r.images) for r in self.store.reviews)
         pending = len(self.store.pending_conversions())
-        msg = f"Отзывов: {n}   Картинок: {imgs}"
+        parts = [f"Отзывов: {n}", f"фото: {imgs}"]
         if pending:
-            msg += f"   Не преобразовано: {pending}"
-        msg += f"   Данные: {self.store.root}"
-        self.statusBar().showMessage(msg)
+            parts.append(f"ждут преобразования: {pending}")
+        self.info.setText("   ·   ".join(parts) + f"      v{__version__}  ")
+        self.btn_convert.setText(f"Преобразовать в JPEG  ({pending})" if pending else "Преобразовать в JPEG")
 
-    def _on_tab(self, idx: int) -> None:
-        if self.tabs.widget(idx) is self.viewer:
-            self.editor.commit()
-            self.viewer.refresh()
-        self._update_status()
-
-    def convert_all(self) -> None:
+    def convert_all(self, quiet: bool = False) -> None:
+        """Обновить папку «Отзывы»: товар / отзыв / «Товар N.jpg»."""
         self.editor.commit()
-        jobs = self.store.pending_conversions()
-        errors = []
-        if jobs:
-            dlg = QProgressDialog("Преобразование в JPEG…", "Отмена", 0, len(jobs), self)
-            dlg.setWindowModality(Qt.WindowModal)
-            dlg.setMinimumDuration(0)
-            for i, (src, dst) in enumerate(jobs):
-                if dlg.wasCanceled():
-                    break
+        dlg = None
+        jobs = len(self.store.pending_conversions())
+
+        def progress(i: int, total: int) -> bool:
+            nonlocal dlg
+            if dlg is None and total:
+                dlg = QProgressDialog("Преобразование в JPEG…", "Отмена", 0, total, self)
+                dlg.setWindowTitle(APP_NAME)
+                dlg.setWindowModality(Qt.WindowModal)
+                dlg.setMinimumDuration(300)
+            if dlg is not None:
                 dlg.setValue(i)
-                dlg.setLabelText(f"Преобразование {i + 1} из {len(jobs)}: {src.name}")
+                dlg.setLabelText(f"Преобразование {min(i + 1, total)} из {total}…")
                 QApplication.processEvents()
-                try:
-                    convert_to_jpeg(src, dst)
-                except Exception as e:  # битый файл не должен ронять всё
-                    errors.append(f"{src}: {e}")
-            dlg.setValue(len(jobs))
+                return not dlg.wasCanceled()
+            return True
+
+        errors = self.store.export(convert_to_jpeg, progress=progress)
+        if dlg is not None:
+            dlg.close()
         self._update_status()
         if errors:
             QMessageBox.warning(self, APP_NAME, "Не удалось преобразовать:\n\n" + "\n".join(errors[:20]))
-        elif not jobs:
-            self.statusBar().showMessage("Все картинки уже преобразованы", 4000)
-        self.tabs.setCurrentWidget(self.viewer)
-        self.viewer.refresh()
+        elif not quiet:
+            self.statusBar().showMessage(
+                f"Готово: преобразовано {jobs} ✓  Папка: {self.store.export_root}" if jobs
+                else "Все картинки уже в JPEG ✓", 5000
+            )
+        if not quiet:
+            self.switch_tab(1)
 
     def open_data_dir(self) -> None:
-        QDesktopServices.openUrl(QUrl.fromLocalFile(str(self.store.root)))
+        target = self.store.export_root / safe_name(self.editor.product.name)
+        if not target.exists():
+            target = self.store.export_root if self.store.export_root.exists() else self.store.root
+        QDesktopServices.openUrl(QUrl.fromLocalFile(str(target)))
 
     def closeEvent(self, e) -> None:
         self.editor._leave_current()
@@ -125,7 +292,7 @@ def main() -> int:
             pass
     app = QApplication(sys.argv)
     app.setApplicationName(APP_NAME)
-    app.setStyle("Fusion")
+    theme.apply(app)
     data_dir = Path(sys.argv[1]) if len(sys.argv) > 1 else None
     w = MainWindow(data_dir)
     w.show()

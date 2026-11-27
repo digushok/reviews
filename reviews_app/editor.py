@@ -1,128 +1,155 @@
 """Вкладка «Ввод отзывов»."""
 from __future__ import annotations
 
+import shutil
+import tempfile
+from pathlib import Path
+
 from PySide6.QtCore import Qt, QTimer, QUrl, Signal
 from PySide6.QtGui import QDesktopServices, QKeySequence, QShortcut
 from PySide6.QtWidgets import (
+    QApplication,
     QFileDialog,
-    QHBoxLayout,
-    QLabel,
+    QFrame,
     QListWidget,
     QListWidgetItem,
+    QMenu,
     QMessageBox,
-    QPushButton,
     QSplitter,
     QVBoxLayout,
     QWidget,
 )
 
-from .storage import Review, Store
-from .widgets import NAME_ROLE, PATH_ROLE, DropImageList, ReviewTextEdit
+from .importer import DropData, extract_images, snapshot
+from .storage import Product, Review, Store
+from .widgets import NAME_ROLE, PATH_ROLE, DropImageList, ReviewTextEdit, button, hrow, label
 
 FILE_FILTER = "Картинки (*.webp *.jpg *.jpeg *.png *.bmp *.gif);;Все файлы (*)"
 
 
 def review_title(store: Store, r: Review) -> str:
-    first = r.text.strip().splitlines()[0] if r.text.strip() else "(без текста)"
-    if len(first) > 40:
-        first = first[:40] + "…"
-    return f"№{store.number(r)}  {first}  [{len(r.images)} фото]"
+    first = r.text.strip().splitlines()[0] if r.text.strip() else "без текста"
+    if len(first) > 34:
+        first = first[:34].rstrip() + "…"
+    photos = f"{len(r.images)} фото" if r.images else "нет фото"
+    return f"Отзыв №{store.number(r)}  ·  {photos}\n{first}"
+
+
+def make_review_list() -> QListWidget:
+    lst = QListWidget()
+    lst.setObjectName("ReviewList")
+    lst.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+    lst.setTextElideMode(Qt.ElideRight)
+    lst.setCursor(Qt.PointingHandCursor)
+    return lst
+
+
+def card() -> tuple[QFrame, QVBoxLayout]:
+    f = QFrame()
+    f.setObjectName("Card")
+    lay = QVBoxLayout(f)
+    lay.setContentsMargins(18, 16, 18, 16)
+    lay.setSpacing(10)
+    return f, lay
 
 
 class EditorTab(QWidget):
     changed = Signal()
+    message = Signal(str)
 
     def __init__(self, store: Store, parent=None):
         super().__init__(parent)
+        self.setObjectName("Page")
         self.store = store
         self.current: Review | None = None
+        self.product: Product = store.ensure_product()
 
         # --- слева: список отзывов ---
-        self.list = QListWidget()
+        left, ll = card()
+        ll.setContentsMargins(12, 14, 12, 12)
+        self.count_badge = label("", "Badge")
+        ll.addLayout(hrow(label("Все отзывы", "Section"), self.count_badge, stretch_at=2))
+        self.list = make_review_list()
         self.list.currentItemChanged.connect(self._on_select)
-        btn_new = QPushButton("+ Новый отзыв")
-        btn_new.clicked.connect(self.next_review)
-        btn_del = QPushButton("Удалить отзыв")
-        btn_del.clicked.connect(self.delete_review)
-        left = QWidget()
-        ll = QVBoxLayout(left)
-        ll.setContentsMargins(0, 0, 0, 0)
-        ll.addWidget(QLabel("Отзывы"))
         ll.addWidget(self.list, 1)
-        lb = QHBoxLayout()
-        lb.addWidget(btn_new)
-        lb.addWidget(btn_del)
-        ll.addLayout(lb)
+        btn_new = button("＋  Новый отзыв")
+        btn_new.clicked.connect(self.next_review)
+        ll.addWidget(btn_new)
 
         # --- справа: редактор ---
-        self.header = QLabel()
-        self.header.setStyleSheet("font-size: 16px; font-weight: bold;")
-        self.text = ReviewTextEdit()
-        self.text.setPlaceholderText("Текст отзыва…")
-        self.text.textChanged.connect(self._on_text_changed)
-        self.text.filesDropped.connect(self.add_images)
+        right, rl = card()
+        self.title = label("", "Title")
+        self.product_badge = label("", "Badge")
+        self.btn_delete = button("Удалить отзыв", "danger")
+        self.btn_delete.clicked.connect(self.delete_review)
+        rl.addLayout(hrow(self.title, self.product_badge, self.btn_delete, stretch_at=2))
 
-        self.images = DropImageList(140)
-        self.images.filesDropped.connect(self.add_images)
+        rl.addWidget(label("Текст отзыва", "Section"))
+        self.text = ReviewTextEdit()
+        self.text.setPlaceholderText("Вставьте или напишите текст отзыва…")
+        self.text.textChanged.connect(self._save_timer_start)
+        self.text.dropped.connect(self.import_drop)
+        rl.addWidget(self.text, 2)
+
+        self.photos_label = label("Фотографии", "Section")
+        btn_add = button("Добавить…", "ghost", "Выбрать картинки на компьютере")
+        btn_add.clicked.connect(self.pick_images)
+        self.btn_rm = button("Удалить выбранные", "ghost", "Или клавиша Delete")
+        self.btn_rm.clicked.connect(self.remove_selected_images)
+        rl.addSpacing(4)
+        rl.addLayout(hrow(self.photos_label, btn_add, self.btn_rm, stretch_at=1, spacing=2))
+        self.images = DropImageList(132)
+        self.images.dropped.connect(self.import_drop)
         self.images.itemDoubleClicked.connect(
             lambda it: QDesktopServices.openUrl(QUrl.fromLocalFile(it.data(PATH_ROLE)))
         )
-        hint = QLabel("Перетащите сюда картинки (.webp и др.) или нажмите «Добавить картинки». Delete — удалить выбранные.")
-        hint.setStyleSheet("color: gray;")
-        hint.setWordWrap(True)
-
-        btn_add = QPushButton("Добавить картинки…")
-        btn_add.clicked.connect(self.pick_images)
-        btn_rm = QPushButton("Удалить выбранные картинки")
-        btn_rm.clicked.connect(self.remove_selected_images)
-        self.btn_next = QPushButton("Сохранить и следующий отзыв  ▶   (Ctrl+Enter)")
-        self.btn_next.setStyleSheet("font-weight: bold; padding: 8px 16px;")
-        self.btn_next.clicked.connect(self.next_review)
-
-        right = QWidget()
-        rl = QVBoxLayout(right)
-        rl.setContentsMargins(0, 0, 0, 0)
-        rl.addWidget(self.header)
-        rl.addWidget(self.text, 2)
-        rl.addWidget(hint)
+        self.images.itemSelectionChanged.connect(self._update_buttons)
+        self.images.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.images.customContextMenuRequested.connect(self._image_menu)
         rl.addWidget(self.images, 3)
-        rb = QHBoxLayout()
-        rb.addWidget(btn_add)
-        rb.addWidget(btn_rm)
-        rb.addStretch(1)
-        rb.addWidget(self.btn_next)
-        rl.addLayout(rb)
+
+        self.btn_next = button("Сохранить и следующий  →", "primary")
+        self.btn_next.setToolTip("Ctrl+Enter")
+        self.btn_next.clicked.connect(self.next_review)
+        rl.addSpacing(4)
+        rl.addLayout(hrow(label("Всё сохраняется автоматически  ·  Ctrl+Enter — следующий отзыв", "Muted"),
+                          self.btn_next, stretch_at=1))
 
         split = QSplitter(Qt.Horizontal)
+        split.setChildrenCollapsible(False)
         split.addWidget(left)
         split.addWidget(right)
         split.setStretchFactor(1, 1)
-        split.setSizes([280, 800])
+        split.setSizes([300, 820])
         lay = QVBoxLayout(self)
+        lay.setContentsMargins(16, 16, 16, 16)
         lay.addWidget(split)
 
         for seq in ("Ctrl+Return", "Ctrl+Enter"):
             QShortcut(QKeySequence(seq), self, self.next_review, context=Qt.WidgetWithChildrenShortcut)
         QShortcut(QKeySequence.Delete, self.images, self.remove_selected_images, context=Qt.WidgetShortcut)
+        QShortcut(QKeySequence.Paste, self.images, self.paste_images, context=Qt.WidgetShortcut)
 
         self._save_timer = QTimer(self, singleShot=True, interval=700)
         self._save_timer.timeout.connect(self.commit)
 
         self.reload()
-        # начинаем с нового пустого отзыва
-        self.next_review()
+        self.next_review()  # начинаем с нового пустого отзыва
 
     # ---------- список ----------
     def reload(self, select: Review | None = None) -> None:
         self.list.blockSignals(True)
         self.list.clear()
-        for r in self.store.reviews:
+        for r in self.store.reviews_of(self.product):
             it = QListWidgetItem(review_title(self.store, r))
             it.setData(Qt.UserRole, r.id)
             self.list.addItem(it)
             if select is not None and r.id == select.id:
                 self.list.setCurrentItem(it)
         self.list.blockSignals(False)
+        if self.list.currentItem():
+            self.list.scrollToItem(self.list.currentItem())
+        self.count_badge.setText(str(len(self.store.reviews_of(self.product))))
 
     def _refresh_current_title(self) -> None:
         if not self.current:
@@ -131,7 +158,17 @@ class EditorTab(QWidget):
             it = self.list.item(i)
             if it.data(Qt.UserRole) == self.current.id:
                 it.setText(review_title(self.store, self.current))
-        self.header.setText(f"Отзыв №{self.store.number(self.current)} из {len(self.store.reviews)}")
+        self.title.setText(f"Отзыв №{self.store.number(self.current)}")
+        self.product_badge.setText(self.product.name)
+        n = len(self.current.images)
+        self.photos_label.setText(f"Фотографии  ·  {n}" if n else "Фотографии")
+        self.count_badge.setText(str(len(self.store.reviews_of(self.product))))
+        self._update_buttons()
+
+    def _update_buttons(self) -> None:
+        self.btn_rm.setVisible(bool(self.images.selectedItems()))
+        self.btn_next.setEnabled(self.current is not None and not self.current.is_empty()
+                                 or bool(self.text.toPlainText().strip()))
 
     def _on_select(self, item: QListWidgetItem | None, _prev=None) -> None:
         if item is None:
@@ -159,7 +196,8 @@ class EditorTab(QWidget):
         if not self.current:
             return
         for i, name in enumerate(self.current.images, 1):
-            self.images.add_image(self.store.source_path(self.current, name), f"{i}. {name}", name)
+            self.images.add_image(self.store.source_path(self.current, name), f"Фото {i}", name)
+        self.images.viewport().update()
 
     def commit(self) -> None:
         self._save_timer.stop()
@@ -172,8 +210,9 @@ class EditorTab(QWidget):
             self.changed.emit()
         self._refresh_current_title()
 
-    def _on_text_changed(self) -> None:
+    def _save_timer_start(self) -> None:
         self._save_timer.start()
+        self._update_buttons()
 
     def _leave_current(self, keep: Review | None = None) -> None:
         """Сохранить текущий отзыв; пустой — выбросить."""
@@ -188,11 +227,14 @@ class EditorTab(QWidget):
         if self.current is not None and self.current.is_empty():
             self.text.setFocus()  # уже стоим на пустом отзыве
             return
+        saved = self.current is not None
         self._leave_current()
-        r = self.store.create()
+        r = self.store.create(self.product)
         self.reload(select=r)
         self.load(r)
         self.changed.emit()
+        if saved:
+            self.message.emit("Отзыв сохранён ✓")
 
     def delete_review(self) -> None:
         if self.current is None:
@@ -208,15 +250,28 @@ class EditorTab(QWidget):
         self.store.delete(self.current)
         self.current = None
         self.changed.emit()
-        if self.store.reviews:
-            r = self.store.reviews[min(idx, len(self.store.reviews) - 1)]
+        rest = self.store.reviews_of(self.product)
+        if rest:
+            r = rest[min(idx, len(rest) - 1)]
             self.reload(select=r)
             self.load(r)
         else:
             self.next_review()
 
+    def set_product(self, p: Product) -> None:
+        """Переключиться на другой товар: открываем новый пустой отзыв в нём."""
+        if p is self.product:
+            return
+        self._leave_current()
+        self.product = p
+        self.reload()
+        self.next_review()
+
+    def refresh_product_name(self) -> None:
+        self.product_badge.setText(self.product.name)
+
     # ---------- картинки ----------
-    def add_images(self, paths: list[str]) -> None:
+    def add_images(self, paths: list[str | Path]) -> int:
         if self.current is None:
             self.next_review()
         self.commit()
@@ -225,6 +280,38 @@ class EditorTab(QWidget):
             self._fill_images()
             self._refresh_current_title()
             self.changed.emit()
+        return added
+
+    def import_drop(self, data: DropData) -> None:
+        """Картинки из перетаскивания/буфера: файлы, браузер, данные."""
+        work = Path(tempfile.mkdtemp(prefix="reviews_drop_"))
+        QApplication.setOverrideCursor(Qt.WaitCursor)
+        self.message.emit("Получаю картинку…")
+        QApplication.processEvents()
+        try:
+            paths, errors = extract_images(data, work)
+            added = self.add_images(paths) if paths else 0
+        finally:
+            QApplication.restoreOverrideCursor()
+            shutil.rmtree(work, ignore_errors=True)
+        if added:
+            self.message.emit(f"Добавлено картинок: {added} ✓")
+        else:
+            details = "\n".join(errors[:5])
+            QMessageBox.warning(
+                self, "Не получилось добавить",
+                "Не удалось получить картинку из того, что перетащили.\n\n"
+                "Попробуйте: правый клик по картинке в браузере → «Копировать картинку», "
+                "затем Ctrl+V здесь. Или сохраните её на компьютер и перетащите файл."
+                + (f"\n\nПодробности:\n{details}" if details else ""),
+            )
+
+    def paste_images(self) -> None:
+        data = snapshot(QApplication.clipboard().mimeData())
+        if data.has_anything():
+            self.import_drop(data)
+        else:
+            self.message.emit("В буфере обмена нет картинки")
 
     def pick_images(self) -> None:
         paths, _ = QFileDialog.getOpenFileNames(self, "Выберите картинки", "", FILE_FILTER)
@@ -242,3 +329,17 @@ class EditorTab(QWidget):
         self._fill_images()
         self._refresh_current_title()
         self.changed.emit()
+
+    def _image_menu(self, pos) -> None:
+        menu = QMenu(self)
+        item = self.images.itemAt(pos)
+        if item is not None:
+            if not item.isSelected():
+                self.images.clearSelection()
+                item.setSelected(True)
+            menu.addAction("Открыть", lambda: QDesktopServices.openUrl(QUrl.fromLocalFile(item.data(PATH_ROLE))))
+            menu.addAction("Удалить", self.remove_selected_images)
+            menu.addSeparator()
+        menu.addAction("Вставить из буфера (Ctrl+V)", self.paste_images)
+        menu.addAction("Добавить с компьютера…", self.pick_images)
+        menu.exec(self.images.mapToGlobal(pos))
